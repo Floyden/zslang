@@ -403,6 +403,97 @@ test "parameter categories differ between a Metal and a SPIR-V layout" {
     }
 }
 
+// ---- Binding ranges and descriptor sets ------------------------------------
+// The view a Vulkan pipeline layout is built from. Each resource is a binding
+// range typed by what it binds, with the mutable flag telling `RWTexture2D`
+// from `Texture2D`; an array is one range of N bindings. A `ParameterBlock` is a
+// range with no descriptor set of its own: its descriptors live in its element
+// type's sets, after the implicit uniform buffer holding its plain fields.
+
+test "binding ranges and descriptor sets describe a SPIR-V layout" {
+    const gpa = std.testing.allocator;
+    const global = try slang.GlobalSession.create();
+    defer global.deinit();
+    var diag: slang.Diagnostics = .{};
+    defer diag.deinit();
+
+    const program = slang.util.compileAndLinkProgram(gpa, global, .{
+        .source =
+        \\struct Mat { Texture2D t; SamplerState s; float4 k; };
+        \\ParameterBlock<Mat>       pb;
+        \\Texture2D                 arr[4];
+        \\RWTexture2D<float4>       rw_tex;
+        \\SamplerCube               env;
+        \\
+        \\[shader("compute")]
+        \\[numthreads(1,1,1)]
+        \\void csMain(uint3 tid : SV_DispatchThreadID) {
+        \\    float4 c = pb.t.SampleLevel(pb.s, float2(0,0), 0) + pb.k;
+        \\    c += arr[tid.x].SampleLevel(pb.s, float2(0,0), 0) + env.SampleLevel(float3(0,0,1), 0);
+        \\    rw_tex[tid.xy] = c;
+        \\}
+        ,
+        .format = .spirv,
+    }, &diag) catch |err| {
+        std.debug.print("spirv compile failed: {s}\ndiag: {s}\n", .{ @errorName(err), diag.text() });
+        return err;
+    };
+    defer program.deinit();
+    const layout = try program.getLayout(&diag);
+
+    // ---- a single resource: one range, one set, one descriptor ----
+    const rw_tex = try typeLayoutOf(layout, "rw_tex");
+    try std.testing.expectEqual(@as(u32, 1), rw_tex.bindingRangeCount());
+    try std.testing.expectEqual(slang.BindingType{ .base = .texture, .mutable = true }, rw_tex.bindingRangeType(0));
+    try std.testing.expectEqual(@as(usize, 1), rw_tex.bindingRangeBindingCount(0));
+    try std.testing.expectEqual(slang.TypeKind.resource, rw_tex.bindingRangeLeafTypeLayout(0).?.kind());
+    try std.testing.expectEqual(@as(?u32, 0), rw_tex.bindingRangeDescriptorSetIndex(0));
+    try std.testing.expectEqual(@as(u32, 0), rw_tex.bindingRangeFirstDescriptorRangeIndex(0));
+    try std.testing.expectEqual(@as(u32, 1), rw_tex.bindingRangeDescriptorRangeCount(0));
+
+    try std.testing.expectEqual(@as(u32, 1), rw_tex.descriptorSetCount());
+    try std.testing.expectEqual(@as(u32, 0), rw_tex.descriptorSetSpaceOffset(0));
+    try std.testing.expectEqual(@as(u32, 1), rw_tex.descriptorSetDescriptorRangeCount(0));
+    try std.testing.expectEqual(@as(usize, 0), rw_tex.descriptorSetDescriptorRangeIndexOffset(0, 0));
+    try std.testing.expectEqual(@as(usize, 1), rw_tex.descriptorSetDescriptorRangeDescriptorCount(0, 0));
+    try std.testing.expectEqual(slang.BindingType{ .base = .texture, .mutable = true }, rw_tex.descriptorSetDescriptorRangeType(0, 0));
+    try std.testing.expectEqual(slang.ParameterCategory.descriptor_table_slot, rw_tex.descriptorSetDescriptorRangeCategory(0, 0));
+
+    // ---- a combined texture-sampler is its own binding type ----
+    const env = try typeLayoutOf(layout, "env");
+    try std.testing.expectEqual(slang.BindingType{ .base = .combined_texture_sampler }, env.bindingRangeType(0));
+
+    // ---- an array is one range of N bindings ----
+    const arr = try typeLayoutOf(layout, "arr");
+    try std.testing.expectEqual(@as(u32, 1), arr.bindingRangeCount());
+    try std.testing.expectEqual(slang.BindingType{ .base = .texture }, arr.bindingRangeType(0));
+    try std.testing.expectEqual(@as(usize, 4), arr.bindingRangeBindingCount(0));
+    try std.testing.expectEqual(@as(usize, 4), arr.descriptorSetDescriptorRangeDescriptorCount(0, 0));
+
+    // ---- a parameter block has no set of its own ----
+    const pb = try typeLayoutOf(layout, "pb");
+    try std.testing.expectEqual(@as(u32, 1), pb.bindingRangeCount());
+    try std.testing.expectEqual(slang.BindingType{ .base = .parameter_block }, pb.bindingRangeType(0));
+    try std.testing.expectEqual(@as(?u32, null), pb.bindingRangeDescriptorSetIndex(0));
+    try std.testing.expectEqual(@as(u32, 0), pb.bindingRangeDescriptorRangeCount(0));
+    try std.testing.expectEqual(@as(u32, 0), pb.descriptorSetCount());
+
+    // Its element holds the texture and sampler, one range each, in one set.
+    // Binding 0 is the implicit uniform buffer for `k`, so they start at 1.
+    const mat = pb.elementTypeLayout().?;
+    try std.testing.expectEqual(@as(u32, 2), mat.bindingRangeCount());
+    try std.testing.expectEqual(slang.BindingType{ .base = .texture }, mat.bindingRangeType(0));
+    try std.testing.expectEqual(slang.BindingType{ .base = .sampler }, mat.bindingRangeType(1));
+    try std.testing.expectEqual(@as(?u32, 0), mat.bindingRangeDescriptorSetIndex(1));
+    try std.testing.expectEqual(@as(u32, 1), mat.bindingRangeFirstDescriptorRangeIndex(1));
+
+    try std.testing.expectEqual(@as(u32, 1), mat.descriptorSetCount());
+    try std.testing.expectEqual(@as(u32, 2), mat.descriptorSetDescriptorRangeCount(0));
+    try std.testing.expectEqual(@as(usize, 1), mat.descriptorSetDescriptorRangeIndexOffset(0, 0));
+    try std.testing.expectEqual(@as(usize, 2), mat.descriptorSetDescriptorRangeIndexOffset(0, 1));
+    try std.testing.expectEqual(slang.BindingType{ .base = .sampler }, mat.descriptorSetDescriptorRangeType(0, 1));
+}
+
 // ---- Regression test for the teardown use-after-free -----------------------
 //
 // A module that `import`s another lands *multiple* source files in the

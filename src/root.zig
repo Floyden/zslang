@@ -396,6 +396,40 @@ pub const ResourceAccess = enum(c_uint) {
     _,
 };
 
+/// `SlangBindingType`: a base type in the low byte plus a `mutable` flag, laid
+/// out to match the C value bit for bit.
+pub const BindingType = packed struct(u32) {
+    base: Base,
+    /// A writable resource, e.g. `RWTexture2D` rather than `Texture2D`.
+    mutable: bool = false,
+    _: u23 = 0,
+
+    pub const Base = enum(u8) {
+        unknown = 0,
+        sampler = 1,
+        texture = 2,
+        constant_buffer = 3,
+        parameter_block = 4,
+        typed_buffer = 5,
+        raw_buffer = 6,
+        combined_texture_sampler = 7,
+        input_render_target = 8,
+        inline_uniform_data = 9,
+        ray_tracing_acceleration_structure = 10,
+        varying_input = 11,
+        varying_output = 12,
+        existential_value = 13,
+        push_constant = 14,
+        _,
+    };
+};
+
+/// Binding/descriptor count of an unbounded array (`SLANG_UNBOUNDED_SIZE`).
+pub const unbounded_size: usize = std.math.maxInt(usize);
+/// Binding/descriptor count that depends on unresolved generic parameters or
+/// link-time constants (`SLANG_UNKNOWN_SIZE`).
+pub const unknown_size: usize = unbounded_size - 1;
+
 pub const ParameterCategory = enum(c_uint) {
     none = 0,
     mixed = 1,
@@ -994,6 +1028,34 @@ extern fn spReflectionTypeLayout_GetType(tl: *SlangReflectionTypeLayout) ?*Slang
 
 extern fn spReflectionTypeLayout_getKind(tl: *SlangReflectionTypeLayout) TypeKind;
 
+extern fn spReflectionTypeLayout_getBindingRangeBindingCount(tl: *SlangReflectionTypeLayout, index: Int) Int;
+
+extern fn spReflectionTypeLayout_getBindingRangeCount(tl: *SlangReflectionTypeLayout) Int;
+
+extern fn spReflectionTypeLayout_getBindingRangeDescriptorRangeCount(tl: *SlangReflectionTypeLayout, index: Int) Int;
+
+extern fn spReflectionTypeLayout_getBindingRangeDescriptorSetIndex(tl: *SlangReflectionTypeLayout, index: Int) Int;
+
+extern fn spReflectionTypeLayout_getBindingRangeFirstDescriptorRangeIndex(tl: *SlangReflectionTypeLayout, index: Int) Int;
+
+extern fn spReflectionTypeLayout_getBindingRangeLeafTypeLayout(tl: *SlangReflectionTypeLayout, index: Int) ?*SlangReflectionTypeLayout;
+
+extern fn spReflectionTypeLayout_getBindingRangeType(tl: *SlangReflectionTypeLayout, index: Int) BindingType;
+
+extern fn spReflectionTypeLayout_getDescriptorSetCount(tl: *SlangReflectionTypeLayout) Int;
+
+extern fn spReflectionTypeLayout_getDescriptorSetDescriptorRangeCategory(tl: *SlangReflectionTypeLayout, set_index: Int, range_index: Int) ParameterCategory;
+
+extern fn spReflectionTypeLayout_getDescriptorSetDescriptorRangeCount(tl: *SlangReflectionTypeLayout, set_index: Int) Int;
+
+extern fn spReflectionTypeLayout_getDescriptorSetDescriptorRangeDescriptorCount(tl: *SlangReflectionTypeLayout, set_index: Int, range_index: Int) Int;
+
+extern fn spReflectionTypeLayout_getDescriptorSetDescriptorRangeIndexOffset(tl: *SlangReflectionTypeLayout, set_index: Int, range_index: Int) Int;
+
+extern fn spReflectionTypeLayout_getDescriptorSetDescriptorRangeType(tl: *SlangReflectionTypeLayout, set_index: Int, range_index: Int) BindingType;
+
+extern fn spReflectionTypeLayout_getDescriptorSetSpaceOffset(tl: *SlangReflectionTypeLayout, set_index: Int) Int;
+
 /// The *type* behind a layout — Slang's `TypeReflection`. A `TypeLayout` answers
 /// where things sit; this answers what the type is.
 pub const Type = struct {
@@ -1098,6 +1160,69 @@ pub const TypeLayout = struct {
     pub fn columnCount(self: TypeLayout) u32 {
         const t = spReflectionTypeLayout_GetType(self.raw) orelse return 0;
         return spReflectionType_GetColumnCount(t);
+    }
+
+    // ---- binding ranges ----
+    // A type's resources flattened into ranges of same-typed bindings, e.g. one
+    // range per texture, sampler or buffer field.
+
+    pub fn bindingRangeCount(self: TypeLayout) u32 {
+        return @intCast(spReflectionTypeLayout_getBindingRangeCount(self.raw));
+    }
+    pub fn bindingRangeType(self: TypeLayout, index: u32) BindingType {
+        return spReflectionTypeLayout_getBindingRangeType(self.raw, index);
+    }
+    /// Number of bindings in the range: 1 for a single resource, N for an array
+    /// of N, or `unbounded_size`/`unknown_size`.
+    pub fn bindingRangeBindingCount(self: TypeLayout, index: u32) usize {
+        return @bitCast(spReflectionTypeLayout_getBindingRangeBindingCount(self.raw, index));
+    }
+    /// The type layout of the resource the range binds (e.g. the `Texture2D`).
+    pub fn bindingRangeLeafTypeLayout(self: TypeLayout, index: u32) ?TypeLayout {
+        return .{ .raw = spReflectionTypeLayout_getBindingRangeLeafTypeLayout(self.raw, index) orelse return null };
+    }
+    /// Index into this type's descriptor sets (see `descriptorSetCount`), or
+    /// null for a range that has none of its own, such as a `ParameterBlock`
+    /// (whose descriptors live in its element type's sets).
+    pub fn bindingRangeDescriptorSetIndex(self: TypeLayout, index: u32) ?u32 {
+        return std.math.cast(u32, spReflectionTypeLayout_getBindingRangeDescriptorSetIndex(self.raw, index));
+    }
+    /// The range's first descriptor range within its descriptor set.
+    pub fn bindingRangeFirstDescriptorRangeIndex(self: TypeLayout, index: u32) u32 {
+        return @intCast(spReflectionTypeLayout_getBindingRangeFirstDescriptorRangeIndex(self.raw, index));
+    }
+    pub fn bindingRangeDescriptorRangeCount(self: TypeLayout, index: u32) u32 {
+        return @intCast(spReflectionTypeLayout_getBindingRangeDescriptorRangeCount(self.raw, index));
+    }
+
+    // ---- descriptor sets ----
+    // The same resources grouped the way a Vulkan pipeline layout wants them:
+    // descriptor sets, each a list of descriptor ranges.
+
+    pub fn descriptorSetCount(self: TypeLayout) u32 {
+        return @intCast(spReflectionTypeLayout_getDescriptorSetCount(self.raw));
+    }
+    /// The set's space (Vulkan `set =`), relative to this type's own.
+    pub fn descriptorSetSpaceOffset(self: TypeLayout, set_index: u32) u32 {
+        return @intCast(spReflectionTypeLayout_getDescriptorSetSpaceOffset(self.raw, set_index));
+    }
+    pub fn descriptorSetDescriptorRangeCount(self: TypeLayout, set_index: u32) u32 {
+        return @intCast(spReflectionTypeLayout_getDescriptorSetDescriptorRangeCount(self.raw, set_index));
+    }
+    /// The range's first binding (Vulkan `binding =`) within the set, or
+    /// `unknown_size`.
+    pub fn descriptorSetDescriptorRangeIndexOffset(self: TypeLayout, set_index: u32, range_index: u32) usize {
+        return @bitCast(spReflectionTypeLayout_getDescriptorSetDescriptorRangeIndexOffset(self.raw, set_index, range_index));
+    }
+    /// Number of descriptors in the range, or `unbounded_size`/`unknown_size`.
+    pub fn descriptorSetDescriptorRangeDescriptorCount(self: TypeLayout, set_index: u32, range_index: u32) usize {
+        return @bitCast(spReflectionTypeLayout_getDescriptorSetDescriptorRangeDescriptorCount(self.raw, set_index, range_index));
+    }
+    pub fn descriptorSetDescriptorRangeType(self: TypeLayout, set_index: u32, range_index: u32) BindingType {
+        return spReflectionTypeLayout_getDescriptorSetDescriptorRangeType(self.raw, set_index, range_index);
+    }
+    pub fn descriptorSetDescriptorRangeCategory(self: TypeLayout, set_index: u32, range_index: u32) ParameterCategory {
+        return spReflectionTypeLayout_getDescriptorSetDescriptorRangeCategory(self.raw, set_index, range_index);
     }
 };
 
